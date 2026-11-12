@@ -1,0 +1,178 @@
+# Baseline build for friendly-band-studio (the M-PYRE fork): firmware package, sound pack and host tests.
+#
+# One-time setup (Settings -> Secrets and variables -> Actions):
+#   variable MPYRE_ASSETS_REPO   owner/name of the PRIVATE repo that holds History Of Sky's sources.
+#                                Its root must be the contents of assets/mpyre-src
+#                                (drums/*.aif, bass.aif, guitar_di.aif, palm_di.aif, ir/).
+#   secret   MPYRE_ASSETS_TOKEN  fine-grained token with read-only "Contents" access to that repo only.
+#   variable MPYRE_ASSETS_REF    optional branch, tag or commit of the assets repo (default: its default branch).
+#
+# Why: tools/gen_samples.py stops without build/mpyre/sets.json, which tools/prep_mpyre.py makes from
+# assets/mpyre-src. That folder is gitignored and not in this repo (BUILDING.md, LICENSING.md).
+#
+# The JieLi toolchain download is not version-pinned upstream. To pick up a new one, bump "v1" in the cache key.
+
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  JIELI_TOOLCHAIN: /home/runner/.jieli/toolchain
+  AC79_SDK: /home/runner/fw-AC79_AIoT_SDK
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check sound-source settings
+        env:
+          ASSETS_REPO: ${{ vars.MPYRE_ASSETS_REPO }}
+          HAVE_TOKEN: ${{ secrets.MPYRE_ASSETS_TOKEN != '' }}
+        run: |
+          ok=1
+          if [ -z "$ASSETS_REPO" ]; then
+            echo "::error::repository variable MPYRE_ASSETS_REPO is not set (owner/name of the private repo with assets/mpyre-src)"
+            ok=0
+          fi
+          if [ "$HAVE_TOKEN" != true ]; then
+            echo "::error::secret MPYRE_ASSETS_TOKEN is not available (not set, or this run has no access to secrets)"
+            ok=0
+          fi
+          [ "$ok" = 1 ] || exit 1
+
+      - name: Fetch sound sources
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.MPYRE_ASSETS_REPO }}
+          token: ${{ secrets.MPYRE_ASSETS_TOKEN }}
+          ref: ${{ vars.MPYRE_ASSETS_REF }}
+          path: assets/mpyre-src
+          lfs: true
+          persist-credentials: false
+
+      - name: Check sound-source layout
+        run: |
+          missing=0
+          for f in bass.aif guitar_di.aif palm_di.aif; do
+            [ -f "assets/mpyre-src/$f" ] || { echo "::error::$f is missing at the root of the assets repo"; missing=1; }
+          done
+          ls assets/mpyre-src/drums/*.aif >/dev/null 2>&1 || { echo "::error::no drums/*.aif in the assets repo"; missing=1; }
+          [ -d assets/mpyre-src/ir ] || echo "::warning::no ir/ folder: the build falls back to a generic cabinet instead of History Of Sky's IRs"
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::the assets repo must hold the contents of assets/mpyre-src at its root"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages and tools
+        run: |
+          python -m pip install Pillow numpy scipy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg valgrind
+
+      - name: Restore JieLi toolchain
+        id: toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.jieli
+          key: jieli-toolchain-v1-${{ runner.os }}-${{ hashFiles('tools/get_toolchain.sh') }}
+
+      - name: Download JieLi toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: sh tools/get_toolchain.sh
+
+      - name: Save JieLi toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.jieli
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
+
+      - name: Check the toolchain runs here
+        run: '"$JIELI_TOOLCHAIN/pi32v2/bin/clang" --version'
+
+      - name: Restore AC79 SDK files
+        id: sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/fw-AC79_AIoT_SDK
+          key: ac79-sdk-files-v1-${{ hashFiles('.github/scripts/fetch-ac79-sdk.sh') }}
+
+      - name: Fetch AC79 SDK files
+        if: steps.sdk.outputs.cache-hit != 'true'
+        run: bash .github/scripts/fetch-ac79-sdk.sh
+
+      - name: Save AC79 SDK files
+        if: steps.sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/fw-AC79_AIoT_SDK
+          key: ${{ steps.sdk.outputs.cache-primary-key }}
+
+      - name: Prepare sounds
+        run: |
+          python tools/prep_mpyre.py
+          python tools/mpyre_slots.py
+
+      - name: Build firmware
+        run: |
+          mkdir -p build
+          sh build.sh 2>&1 | tee build/build.log
+          if grep -q '^warning: SDK' build/build.log; then
+            echo "::error::an AC79 SDK file differs from AC79NN_SDK_V1.2.1_2023-12-13, so the package does not match the reference"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Host and web tests
+        run: sh tests/run_tests.sh 2>&1 | tee build/tests.log
+
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '### Build'
+            echo '```'
+            grep -E '^(app|loader|package) ' build/build.log 2>/dev/null || echo 'no build output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: friendly-band-studio-${{ github.sha }}
+          path: |
+            build/felucca.fwsc
+            build/felucca.bin
+            build/loader/ota.bin
+            build/mpyre/soundpack.bin
+            build/ATTRIBUTION.txt
+            build/build.log
+            build/tests.log
+          if-no-files-found: warn
+          retention-days: 30
